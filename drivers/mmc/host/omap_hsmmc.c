@@ -45,6 +45,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/platform_data/hsmmc-omap.h>
+#include <linux/mmc/sd.h>
 
 /* OMAP HSMMC Host Controller Registers */
 #define OMAP_HSMMC_SYSSTATUS	0x0014
@@ -182,6 +183,12 @@
 #define CON_PADEN		(1 << 15)
 #define PSTATE_CLEV		(1 << 24)
 #define PSTATE_DLEV		(0xF << 20)
+#define PSTATE_DLEV_DAT0	(0x1 << 20)
+
+#define MMC_BLOCK_TRANSFER_TIME_NS(blksz, bus_width, freq)		\
+				   ((unsigned long long)		\
+				   (2 * (((blksz) * NSEC_PER_SEC *	\
+				   (8 / (bus_width))) / (freq))))
 
 /*
  * One controller can have multiple slots, like on some omap boards using
@@ -209,6 +216,7 @@ struct omap_hsmmc_host {
 	struct	mmc_host	*mmc;
 	struct	mmc_request	*mrq;
 	struct	mmc_command	*cmd;
+	u32			last_cmd;
 	struct	mmc_data	*data;
 	struct	clk		*fclk;
 	struct	clk		*dbclk;
@@ -247,8 +255,7 @@ struct omap_hsmmc_host {
 	struct	omap_hsmmc_platform_data	*pdata;
 
 	struct timer_list	timer;
-	unsigned long		data_timeout;
-	unsigned int		need_i834_errata:1;
+	unsigned long long	data_timeout;
 
 	struct pinctrl		*pinctrl;
 	struct pinctrl_state	*pinctrl_state;
@@ -659,7 +666,7 @@ static void omap_hsmmc_enable_irq(struct omap_hsmmc_host *host,
 		irq_mask &= ~(BRR_EN | BWR_EN);
 
 	/* Disable timeout for erases or when using software timeout */
-	if (cmd && (cmd->opcode == MMC_ERASE || host->need_i834_errata))
+	if (cmd && (cmd->opcode == MMC_ERASE || host->data_timeout))
 		irq_mask &= ~DTO_EN;
 
 	if (host->flags & CLKEXTFREE_ENABLED)
@@ -751,22 +758,6 @@ static void omap_hsmmc_set_clock(struct omap_hsmmc_host *host)
 
 		OMAP_HSMMC_WRITE(host->base, HCTL, regval);
 	}
-
-	/*
-	 * DRA7 Errata No i834: When using high speed HS200 and SDR104
-	 * cards, the functional clock for MMC module will be 192MHz.
-	 * At this frequency, the maximum obtainable timeout (DTO =0xE)
-	 * in hardware is (1/192MHz)*2^27 = 700ms. Commands taking longer
-	 * than 700ms will be affected by this small window frame and
-	 * will be timing out frequently even without a genune timeout
-	 * from the card. Workarround for this errata is use a software
-	 * timer instead of hardware timer to provide the delay requested
-	 * by the upper layer
-	 */
-	if (ios->clock == 192000000)
-		host->need_i834_errata = true;
-	else
-		host->need_i834_errata = false;
 
 	omap_hsmmc_start_clock(host);
 }
@@ -1029,6 +1020,7 @@ omap_hsmmc_start_command(struct omap_hsmmc_host *host, struct mmc_command *cmd,
 		cmdreg |= DMAE;
 
 	host->req_in_progress = 1;
+	host->last_cmd = cmd->opcode;
 
 	OMAP_HSMMC_WRITE(host->base, ARG, cmd->arg);
 	OMAP_HSMMC_WRITE(host->base, CMD, cmdreg);
@@ -1292,8 +1284,16 @@ static void omap_hsmmc_do_irq(struct omap_hsmmc_host *host, int status)
 	}
 
 	OMAP_HSMMC_WRITE(host->base, STAT, status);
-	if (end_cmd || ((status & CC_EN) && host->cmd))
+	if (end_cmd || ((status & CC_EN) && host->cmd)) {
 		omap_hsmmc_cmd_done(host, host->cmd);
+		if (host->data_timeout) {
+			unsigned long timeout;
+
+			timeout = jiffies +
+				  nsecs_to_jiffies(host->data_timeout);
+			mod_timer(&host->timer, timeout);
+		}
+	}
 	if ((end_trans || (status & TC_EN)) && host->mrq)
 		omap_hsmmc_xfer_done(host, data);
 }
@@ -1308,16 +1308,18 @@ static irqreturn_t omap_hsmmc_irq(int irq, void *dev_id)
 
 	status = OMAP_HSMMC_READ(host->base, STAT);
 
-	/*
-	 * During a successful bulk data transfer command-completion
-	 * interrupt and transfer-completion interrupt will be generated,
-	 * but software-timeout timer should be deleted only on non-CC
-	 * interrupts (transfer complete or error)
-	 */
-	if (host->need_i834_errata && (status & (~CC_EN)))
-		del_timer(&host->timer);
-
 	while (status & (INT_EN_MASK | CIRQ_EN)) {
+		/*
+		 * During a successful bulk data transfer command-completion
+		 * interrupt and transfer-completion interrupt will be
+		 * generated, but software-timeout timer should be deleted
+		 * only on non-cc interrupts (transfer complete or error)
+		 */
+		if (host->data_timeout && (status & (~CC_EN))) {
+			del_timer(&host->timer);
+			host->data_timeout = 0;
+		}
+
 		if (host->req_in_progress)
 			omap_hsmmc_do_irq(host, status);
 
@@ -1347,6 +1349,7 @@ static void omap_hsmmc_soft_timeout(unsigned long data)
 		omap_hsmmc_xfer_done(host, host->data);
 	else if (host->cmd)
 		omap_hsmmc_cmd_done(host, host->cmd);
+	host->data_timeout = 0;
 }
 
 static void set_sd_bus_power(struct omap_hsmmc_host *host)
@@ -1544,52 +1547,68 @@ static void set_data_timeout(struct omap_hsmmc_host *host,
 {
 	unsigned int timeout, cycle_ns;
 	uint32_t reg, clkd, dto = 0;
+	struct mmc_ios *ios = &host->mmc->ios;
+	struct mmc_data *data = host->mrq->data;
 
 	reg = OMAP_HSMMC_READ(host->base, SYSCTL);
 	clkd = (reg & CLKD_MASK) >> CLKD_SHIFT;
 	if (clkd == 0)
 		clkd = 1;
 
-	if (host->need_i834_errata) {
-		unsigned long delta;
-
-		delta = (timeout_clks / (host->clk_rate / clkd));
-
-		/*
-		 * We should really be using just timeout_ns + delta,
-		 * however during the experiments observed that the transfer
-		 * complete happens after really long time (roughly 3 times
-		 * of the advertised timeout value). With the eMMC card in
-		 * DRA72 EVM, the card advertised 960ms but the (worst case)
-		 * transfer complete came after 2.6 seconds.
-		 */
-		host->data_timeout = 3 * (timeout_ns + delta);
-		if (host->data_timeout < MMC_TIMEOUT_MS * NSEC_PER_MSEC)
-			host->data_timeout = MMC_TIMEOUT_MS * NSEC_PER_MSEC;
-
-		return;
-	}
-
 	cycle_ns = 1000000000 / (host->clk_rate / clkd);
 	timeout = timeout_ns / cycle_ns;
 	timeout += timeout_clks;
-	if (timeout) {
-		while ((timeout & 0x80000000) == 0) {
-			dto += 1;
-			timeout <<= 1;
-		}
-		dto = 31 - dto;
+
+	if (!timeout)
+		goto out;
+
+	while ((timeout & 0x80000000) == 0) {
+		dto += 1;
 		timeout <<= 1;
-		if (timeout && dto)
-			dto += 1;
-		if (dto >= 13)
-			dto -= 13;
-		else
-			dto = 0;
-		if (dto > 14)
-			dto = 14;
+	}
+	dto = 31 - dto;
+	timeout <<= 1;
+	if (timeout && dto)
+		dto += 1;
+	if (dto >= 13)
+		dto -= 13;
+	else
+		dto = 0;
+	if (dto > 14) {
+		/*
+		 * DRA7 Errata No i834: When using high speed HS200 and
+		 * SDR104 cards, the functional clock for MMC module
+		 * will be 192MHz. At this frequency, the maximum
+		 * obtainable timeout (DTO =0xE) in hardware is
+		 * (1/192MHz)*2^27 = 700ms. Commands taking longer than
+		 * 700ms will be affected by this small window frame
+		 * and will be timing out frequently even without a
+		 * genuine timeout from the card. Workaround for
+		 * this errata is use a software timer instead of
+		 * hardware timer to provide the timeout requested
+		 * by the upper layer.
+		 *
+		 * The timeout from the upper layer denotes the delay
+		 * between the end bit of the read command and the
+		 * start bit of the data block and in the case of
+		 * multiple-read operation, they also define the
+		 * typical delay between the end bit of a data
+		 * block and the start bit of next data block.
+		 *
+		 * Calculate the total timeout value for the entire
+		 * transfer to complete from the timeout value given
+		 * by the upper layer.
+		 */
+		if (data)
+			host->data_timeout = (data->blocks *
+					      (timeout_ns +
+					      MMC_BLOCK_TRANSFER_TIME_NS(
+					      data->blksz, ios->bus_width,
+					      ios->clock)));
+		dto = 14;
 	}
 
+out:
 	reg &= ~DTO_MASK;
 	reg |= dto << DTO_SHIFT;
 	OMAP_HSMMC_WRITE(host->base, SYSCTL, reg);
@@ -1609,12 +1628,6 @@ static void omap_hsmmc_start_dma_transfer(struct omap_hsmmc_host *host)
 	chan = omap_hsmmc_get_dma_chan(host, req->data);
 	dma_async_issue_pending(chan);
 
-	if (host->need_i834_errata) {
-		unsigned long timeout;
-
-		timeout = jiffies + nsecs_to_jiffies(host->data_timeout);
-		mod_timer(&host->timer, timeout);
-	}
 }
 
 /*
@@ -1624,16 +1637,24 @@ static int
 omap_hsmmc_prepare_data(struct omap_hsmmc_host *host, struct mmc_request *req)
 {
 	int ret;
+	unsigned int timeout;
+
 	host->data = req->data;
 
 	if (req->data == NULL) {
 		OMAP_HSMMC_WRITE(host->base, BLK, 0);
-		/*
-		 * Set an arbitrary 100ms data timeout for commands with
-		 * busy signal.
-		 */
-		if (req->cmd->flags & MMC_RSP_BUSY)
-			set_data_timeout(host, 100000000U, 0);
+		if (req->cmd->flags & MMC_RSP_BUSY) {
+			timeout = req->cmd->busy_timeout * NSEC_PER_MSEC;
+
+			/*
+			 * Set an arbitrary 100ms data timeout for commands with
+			 * busy signal and no indication of busy_timeout.
+			 */
+			if (!timeout)
+				timeout = 100000000U;
+
+			set_data_timeout(host, timeout, 0);
+		}
 		return 0;
 	}
 
@@ -2107,9 +2128,26 @@ static int omap_hsmmc_card_busy(struct mmc_host *mmc)
 {
 	struct omap_hsmmc_host *host;
 	u32 val;
+	u32 reg;
 	int ret;
 
 	host  = mmc_priv(mmc);
+
+	if (host->last_cmd != SD_SWITCH_VOLTAGE) {
+		/*
+		 * PADEN should be set for DLEV to reflect the correct
+		 * state of data lines atleast for MMC1 on AM57x.
+		 */
+		reg = OMAP_HSMMC_READ(host->base, CON);
+		reg |= CON_PADEN;
+		OMAP_HSMMC_WRITE(host->base, CON, reg);
+		val = OMAP_HSMMC_READ(host->base, PSTATE);
+		reg &= ~CON_PADEN;
+		OMAP_HSMMC_WRITE(host->base, CON, reg);
+		if (val & PSTATE_DLEV_DAT0)
+			return false;
+		return true;
+	}
 
 	val = OMAP_HSMMC_READ(host->base, AC12);
 	if (val & AC12_V1V8_SIGEN)
